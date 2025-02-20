@@ -142,10 +142,3 @@ def ohlc_to_edge_features(data, size=(700, 700)):
     
     return edges.flatten()
 
-
-if __name__ == "__main__":
-    data = pd.read_csv("1d_test.csv", index_col=0, parse_dates=True)
-    data = data.tail(100)
-    save_chart(data)
-    edge_features2 = ohlc_to_edge_features(data)
-    rec_img2 = reconstruct_image_from_edges(edge_features2)
