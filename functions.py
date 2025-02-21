@@ -3,6 +3,12 @@ from matplotlib import pyplot as plt
 import numpy as np
 import pandas as pd
 import mplfinance as mpf
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+import warnings
+# Add this line at the top with your other imports
+warnings.filterwarnings('ignore', category=UserWarning, message='X does not have valid feature names*')
 
 
 def image_to_edge_features(image_path):
@@ -142,3 +148,185 @@ def ohlc_to_edge_features(data, size=(700, 700)):
     
     return edges.flatten()
 
+
+def add_target_column(df, bars_forward):
+    df = df.copy()
+    df['target'] = 0
+    
+    for i in range(len(df) - bars_forward):
+        current_close = df.iloc[i]['close']
+        next_highs = df.iloc[i+1:i+bars_forward+1]['high'].max()
+        next_lows = df.iloc[i+1:i+bars_forward+1]['low'].min()
+        
+        if next_highs > current_close * 1.02:
+            df.iloc[i, df.columns.get_loc('target')] = 1
+        elif next_lows < current_close * 0.98:
+            df.iloc[i, df.columns.get_loc('target')] = -1
+    
+    return df
+
+
+def test(df, tp, model, lookback=100, size=(700, 700)):
+    """
+    Backtests the trading strategy using model predictions
+    
+    Parameters:
+    - df: DataFrame with OHLC data
+    - tp: Take profit percentage
+    - model: Trained model for predictions
+    - lookback: Number of candles to look back for feature generation
+    - size: Size of the edge features image
+    """
+    usdt = 1000
+    fee = 0.0005
+    long = False
+    short = False
+    longs = 0
+    shorts = 0
+    wins = 0
+    losses = 0
+    equity_curve = []
+    previous_usdt = usdt
+
+    # We need at least lookback periods before we can start trading
+    for i in range(lookback, len(df)):
+        # Generate features for current candle
+        window_data = df.iloc[i-lookback:i]
+        edge_features = ohlc_to_edge_features(window_data, size=size)
+        
+        # Reshape features for prediction
+        features = edge_features.reshape(1, -1)
+        
+        # Get model prediction
+        prediction = model.predict(features)[0]
+        
+        current_row = df.iloc[i]
+        
+        # Check existing positions
+        if long:
+            if current_row['high'] >= long_entry*(1+tp):
+                usdt += 100*(1+tp) - 100*(1+tp) * fee
+                long = False
+                wins += 1
+            elif current_row['low'] <= long_entry*(1-tp/2):
+                usdt += 100*(1-tp/2) - 100*(1-tp/2)*fee
+                long = False
+                losses += 1
+
+        if short:
+            if current_row['low'] <= short_entry*(1-tp):
+                usdt += 100*(1+tp) - 100*(1+tp)*fee
+                short = False
+                wins += 1
+            elif current_row['high'] >= short_entry*(1+tp/2):
+                usdt += 100*(1-tp/2) - 100*(1-tp/2)*fee
+                short = False
+                losses += 1
+
+        # Enter new positions based on model predictions
+        if prediction == 1 and not long and usdt > 100:
+            longs += 1
+            long_entry = current_row['close']
+            long = True
+            usdt -= 100 + 100*fee
+
+        if prediction == -1 and not short and usdt > 100:
+            shorts += 1
+            short_entry = current_row['close']
+            short = True
+            usdt -= 100 + 100*fee
+
+        # Track equity
+        if usdt != previous_usdt:
+            equity_curve.append(usdt)
+            print(f"Equity: ${usdt:.2f}")
+            previous_usdt = usdt
+
+    print(f"\nFinal Results:")
+    print(f"Shorts: {shorts}")
+    print(f"Longs: {longs}")
+    print(f"Wins: {wins}")
+    print(f"Losses: {losses}")
+    print(f"Winrate: {(wins/(wins+losses))*100:.2f}%")
+    print(f"Final Equity: ${usdt:.2f}")
+
+    # Plot equity curve
+    plt.figure(figsize=(12, 6))
+    plt.plot(equity_curve)
+    plt.title('Equity Curve')
+    plt.xlabel('Candles')
+    plt.ylabel('Equity ($)')
+    plt.grid(True)
+    plt.show()
+
+    return usdt
+
+
+def final_df(df, lookback=100, size=(700, 700)):
+    """Creates a dataframe with edge features and target labels"""
+    # Pre-allocate numpy array for edge features
+    num_samples = len(df) - lookback
+    num_features = size[0] * size[1]  # Total pixels in the edge detection output
+    edge_features_array = np.zeros((num_samples, num_features))
+    
+    # Add target column first
+    df = add_target_column(df, 5)
+    
+    for i in range(lookback, len(df)):
+        # Get the last 100 candles
+        window_data = df.iloc[i-lookback:i]
+        # Generate edge features
+        edge_features = ohlc_to_edge_features(window_data, size=size)
+        edge_features_array[i-lookback] = edge_features
+        print(i)
+    
+    # Create final dataframe with features
+    final_df = pd.DataFrame(
+        edge_features_array,
+        columns=[f'feature_{i}' for i in range(num_features)]
+    )
+    print("done")
+    
+    # Add target column
+    final_df['target'] = df['target'].iloc[lookback:].reset_index(drop=True)
+    print("done")
+    
+    return final_df
+
+
+def test_random_forest(df, test_size=0.2, n_estimators=100):
+    """Creates, trains and tests a Random Forest model with balanced class weights"""
+    # Separate features and target
+    X = df.drop('target', axis=1)
+    y = df['target']
+    
+    # Split data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+    
+    # Create and train the model with balanced class weights
+    print("Training Random Forest...")
+    rf = RandomForestClassifier(
+        n_estimators=n_estimators,
+        class_weight='balanced',  # This helps with imbalanced classes
+        random_state=42
+    )
+    rf.fit(X_train, y_train)
+    
+    # Make predictions
+    print("Making predictions...")
+    y_pred = rf.predict(X_test)
+    print(y_pred)
+    
+    # Calculate accuracy
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f"\nAccuracy: {accuracy * 100:.2f}%")
+    
+    # Print detailed classification report
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred))
+    
+    # Print confusion matrix
+    print("\nConfusion Matrix:")
+    print(confusion_matrix(y_test, y_pred))
+    
+    return rf
