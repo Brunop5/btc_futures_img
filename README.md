@@ -63,3 +63,6 @@ I chose `scikit-learn` and `RandomForestClassifier` mostly due to my prior exper
 
 This was a wild, exploratory project born from the frustration of trading "by feel" and a desire to turn chart visuals into code.  
 It’s far from perfect, but I learned a lot — and I plan to revisit it with more ML experience.
+
+## Other Projects
+Check out my other project - Mint Machina (mintmachina.com) - a website for creating cryptocurrency easily
