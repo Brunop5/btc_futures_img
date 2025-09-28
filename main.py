@@ -3,9 +3,9 @@ from functions import *
 if __name__ == "__main__":
     data = pd.read_csv("1h_test.csv", index_col=0, parse_dates=True)
     train_data = data.head(2000)
-    df = final_df(train_data)
-    rf = test_random_forest(df)
-    test(data.tail(10000), 0.02, rf)
+    df = create_pixel_dataframe(train_data)
+    X, y = preprocess_data(df)
+    print("Data Preprocessed")
     
     #df = add_target_column(data, 5)
     #print(len(df[df['target']==1]), len(df[df['target']==-1]))

@@ -2,13 +2,22 @@ import cv2
 from matplotlib import pyplot as plt
 import numpy as np
 import pandas as pd
-import mplfinance as mpf
+import time
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+
+import tensorflow as tf
+from tensorflow import keras
+from keras.utils import to_categorical
+from keras.models import Sequential, save_model
+from keras.layers import Dense, Input
+
 import warnings
 # Add this line at the top with your other imports
 warnings.filterwarnings('ignore', category=UserWarning, message='X does not have valid feature names*')
+
+
 
 
 def image_to_edge_features(image_path):
@@ -262,71 +271,204 @@ def test(df, tp, model, lookback=100, size=(700, 700)):
     return usdt
 
 
-def final_df(df, lookback=100, size=(700, 700)):
-    """Creates a dataframe with edge features and target labels"""
-    # Pre-allocate numpy array for edge features
+def ohlc_to_pixel_image(data, size=(64, 64), style='candlestick'):
+    """
+    Converts OHLC data directly to pixel images for neural network training
+    
+    Parameters:
+    - data: DataFrame with OHLC data
+    - size: Tuple of (height, width) for the image
+    - style: 'candlestick' or 'line' chart style
+    
+    Returns:
+    - 2D numpy array representing the image pixels
+    """
+    # Normalize price data to 0-1 range
+    min_price = min(data['low'].min(), data['open'].min(), data['close'].min())
+    max_price = max(data['high'].max(), data['open'].max(), data['close'].max())
+    price_range = max_price - min_price
+    
+    # Create empty canvas (white background)
+    canvas = np.ones(size, dtype=np.uint8) * 255
+    
+    # Calculate scaling factors
+    time_scale = size[1] / len(data)
+    price_scale = (size[0] - 10) / price_range  # Leave some margin
+    
+    if style == 'candlestick':
+        # Calculate candle width
+        candle_width = max(int(time_scale * 0.8), 1)
+        
+        for i, row in enumerate(data.itertuples()):
+            # Calculate x position (center of candle)
+            x = int(i * time_scale + time_scale/2)
+            
+            # Calculate y positions for OHLC (flip the y-coordinates)
+            open_y = size[0] - 5 - int((row.open - min_price) * price_scale)
+            high_y = size[0] - 5 - int((row.high - min_price) * price_scale)
+            low_y = size[0] - 5 - int((row.low - min_price) * price_scale)
+            close_y = size[0] - 5 - int((row.close - min_price) * price_scale)
+            
+            # Determine if candle is bullish or bearish
+            is_bullish = row.close > row.open
+            
+            # Draw wicks (thin lines) - BLACK on white background
+            x_wick = max(x - 1, 0)
+            x_wick_end = min(x + 1, size[1])
+            canvas[high_y:low_y+1, x_wick:x_wick_end] = 0  # Black wicks
+            
+            # Draw candle body - BLACK on white background
+            body_top = min(open_y, close_y)
+            body_bottom = max(open_y, close_y)
+            x_start = max(x - candle_width//2, 0)
+            x_end = min(x + candle_width//2, size[1])
+            
+            # Both bullish and bearish candles are black on white background
+            canvas[body_top:body_bottom+1, x_start:x_end] = 0  # Black body
+                
+    elif style == 'line':
+        # Draw line chart - BLACK line on white background
+        for i in range(len(data) - 1):
+            x1 = int(i * time_scale)
+            x2 = int((i + 1) * time_scale)
+            
+            y1 = size[0] - 5 - int((data.iloc[i]['close'] - min_price) * price_scale)
+            y2 = size[0] - 5 - int((data.iloc[i+1]['close'] - min_price) * price_scale)
+            
+            # Draw line between points - BLACK on white background
+            if x2 < size[1] and y1 >= 0 and y2 >= 0 and y1 < size[0] and y2 < size[0]:
+                # Simple line drawing
+                canvas[y1, x1] = 0  # Black pixel
+                canvas[y2, x2] = 0  # Black pixel
+                # Fill in between
+                if abs(y2 - y1) > 1:
+                    for y in range(min(y1, y2), max(y1, y2) + 1):
+                        if 0 <= y < size[0]:
+                            canvas[y, x1] = 0  # Black pixel
+    
+    return canvas
+
+
+def visualize_pixel_image(pixel_image, title="Pixel Image"):
+    """
+    Visualizes the generated pixel image
+    
+    Parameters:
+    - pixel_image: 2D numpy array representing the image
+    - title: Title for the plot
+    """
+    plt.figure(figsize=(8, 8))
+    plt.imshow(pixel_image, cmap='gray', vmin=0, vmax=255)
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+
+def create_pixel_dataframe(df, lookback=100, image_size=(256, 256), style='candlestick'):
+    """
+    Creates a DataFrame with pixel features for neural network training
+    
+    Parameters:
+    - df: DataFrame with OHLC data
+    - lookback: Number of candles to look back for each image
+    - image_size: Size of the generated images (height, width)
+    - style: Chart style ('candlestick' or 'line')
+    
+    Returns:
+    - DataFrame where each row contains flattened pixel values and target
+    """
+    # Pre-allocate numpy array for pixel features
     num_samples = len(df) - lookback
-    num_features = size[0] * size[1]  # Total pixels in the edge detection output
-    edge_features_array = np.zeros((num_samples, num_features))
+    num_pixels = image_size[0] * image_size[1]
+    pixel_features_array = np.zeros((num_samples, num_pixels))
     
     # Add target column first
-    df = add_target_column(df, 5)
+    df_with_target = add_target_column(df, 5)
+    
+    print(f"Generating {num_samples} pixel images...")
+    print(f"Each image: {image_size[0]}x{image_size[1]} = {image_size[0]*image_size[1]:,} pixels")
+    print(f"Total pixels to process: {num_samples * image_size[0] * image_size[1]:,}")
+    
+    start_time = time.time()
     
     for i in range(lookback, len(df)):
-        # Get the last 100 candles
+        # Get the window of data for this image
         window_data = df.iloc[i-lookback:i]
-        # Generate edge features
-        edge_features = ohlc_to_edge_features(window_data, size=size)
-        edge_features_array[i-lookback] = edge_features
-        print(i)
+        
+        # Generate pixel image
+        pixel_image = ohlc_to_pixel_image(window_data, size=image_size, style=style)
+        
+        # Flatten the image to 1D array
+        pixel_features_array[i-lookback] = pixel_image.flatten()
+        
+        # Progress tracking
+        current_progress = i - lookback + 1
+        if current_progress % 10 == 0 or current_progress == num_samples:
+            elapsed = time.time() - start_time
+            rate = current_progress / elapsed if elapsed > 0 else 0
+            eta = (num_samples - current_progress) / rate if rate > 0 else 0
+            
+            print(f"Progress: {current_progress}/{num_samples} ({current_progress/num_samples*100:.1f}%) - "
+                  f"Rate: {rate:.1f} images/sec - ETA: {eta:.1f}s")
     
-    # Create final dataframe with features
-    final_df = pd.DataFrame(
-        edge_features_array,
-        columns=[f'feature_{i}' for i in range(num_features)]
-    )
-    print("done")
+    # Create final dataframe with pixel features
+    pixel_columns = [f'pixel_{i}' for i in range(num_pixels)]
+    final_df = pd.DataFrame(pixel_features_array, columns=pixel_columns)
     
-    # Add target column
-    final_df['target'] = df['target'].iloc[lookback:].reset_index(drop=True)
-    print("done")
+    # Add target column at the START
+    target_values = df_with_target['target'].iloc[lookback:].reset_index(drop=True)
+    final_df.insert(0, 'target', target_values)
     
+    print(f"Done! Created DataFrame with {len(final_df)} samples and {num_pixels} pixel features each.")
+    
+
     return final_df
 
 
-def test_random_forest(df, test_size=0.2, n_estimators=100):
-    """Creates, trains and tests a Random Forest model with balanced class weights"""
-    # Separate features and target
-    X = df.drop('target', axis=1)
-    y = df['target']
+def preprocess_data(df: pd.DataFrame, image_size=(256, 256)):
+    X = df.iloc[:, 1:]
+    y = df.iloc[:, 0]
+
+    # Convert to numeric and handle any errors
+    X = X.apply(pd.to_numeric, errors='coerce')
+    X = X.fillna(0)  # Fill NaN values with 0
     
-    # Split data into training and testing sets
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+    # Convert to numpy array and normalize
+    X = X.values / 255.0
     
-    # Create and train the model with balanced class weights
-    print("Training Random Forest...")
-    rf = RandomForestClassifier(
-        n_estimators=n_estimators,
-        class_weight='balanced',  # This helps with imbalanced classes
-        random_state=42
-    )
-    rf.fit(X_train, y_train)
+    # Print pixel statistics
+    non_white_pixels = np.count_nonzero(X[0] != 1.0)
+    print(f"Pixels in first row that are not white (1.0): {non_white_pixels}")
     
-    # Make predictions
-    print("Making predictions...")
-    y_pred = rf.predict(X_test)
-    print(y_pred)
+    # Reshape to image format (height, width, channels)
+    X = X.reshape(-1, image_size[0], image_size[1], 1)
+
+    # Print target distribution BEFORE categorical conversion
+    y_original = df.iloc[:, 0].values
+    y_n1_count = np.count_nonzero(y_original == -1)
+    y_0_count = np.count_nonzero(y_original == 0)
+    y_1_count = np.count_nonzero(y_original == 1)
+    print(f"Number of times y is -1: {y_n1_count}")
+    print(f"Number of times y is 0: {y_0_count}")
+    print(f"Number of times y is 1: {y_1_count}")
     
-    # Calculate accuracy
-    accuracy = accuracy_score(y_test, y_pred)
-    print(f"\nAccuracy: {accuracy * 100:.2f}%")
+    # Convert target to categorical (3 classes: -1, 0, 1)
+    y = to_categorical(y + 1, num_classes=3)  # Shift -1,0,1 to 0,1,2
+
+    return X, y
+
+
+def build_model(image_size):
+    model = Sequential([
+        Input(image_size[0], image_size[1], 1),
+        Dense(256, activation="relu"),
+        Dense(128, activation="relu"),
+        Dense(3, activation="softmax")
+    ])
+
+    model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
+
+    return model
+
+def fit_model(model, X, y):
     
-    # Print detailed classification report
-    print("\nClassification Report:")
-    print(classification_report(y_test, y_pred))
-    
-    # Print confusion matrix
-    print("\nConfusion Matrix:")
-    print(confusion_matrix(y_test, y_pred))
-    
-    return rf
