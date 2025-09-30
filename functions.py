@@ -3,20 +3,24 @@ from matplotlib import pyplot as plt
 import numpy as np
 import pandas as pd
 import time
-from sklearn.ensemble import RandomForestClassifier
+import os
+from pathlib import Path
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from sklearn.utils import class_weight
+from sklearn.utils.class_weight import compute_class_weight
 
 import tensorflow as tf
 from tensorflow import keras
 from keras.utils import to_categorical
-from keras.models import Sequential, save_model
-from keras.layers import Dense, Input
+from keras.models import Sequential, load_model
+from keras.layers import Dense, Input, Flatten
+from keras.callbacks import EarlyStopping, ModelCheckpoint
 
 import warnings
 # Add this line at the top with your other imports
 warnings.filterwarnings('ignore', category=UserWarning, message='X does not have valid feature names*')
-
 
 
 
@@ -167,9 +171,9 @@ def add_target_column(df, bars_forward):
         next_highs = df.iloc[i+1:i+bars_forward+1]['high'].max()
         next_lows = df.iloc[i+1:i+bars_forward+1]['low'].min()
         
-        if next_highs > current_close * 1.02:
+        if next_highs > current_close * 1.007:
             df.iloc[i, df.columns.get_loc('target')] = 1
-        elif next_lows < current_close * 0.98:
+        elif next_lows < current_close * 0.993:
             df.iloc[i, df.columns.get_loc('target')] = -1
     
     return df
@@ -383,11 +387,11 @@ def create_pixel_dataframe(df, lookback=100, image_size=(256, 256), style='candl
     pixel_features_array = np.zeros((num_samples, num_pixels))
     
     # Add target column first
-    df_with_target = add_target_column(df, 5)
+    df_with_target = add_target_column(df, 3)
     
-    print(f"Generating {num_samples} pixel images...")
-    print(f"Each image: {image_size[0]}x{image_size[1]} = {image_size[0]*image_size[1]:,} pixels")
-    print(f"Total pixels to process: {num_samples * image_size[0] * image_size[1]:,}")
+    print("Target distribution:")
+    print(df_with_target['target'].value_counts().sort_index())
+    print(f"Total samples: {len(df_with_target)}")
     
     start_time = time.time()
     
@@ -407,9 +411,6 @@ def create_pixel_dataframe(df, lookback=100, image_size=(256, 256), style='candl
             elapsed = time.time() - start_time
             rate = current_progress / elapsed if elapsed > 0 else 0
             eta = (num_samples - current_progress) / rate if rate > 0 else 0
-            
-            print(f"Progress: {current_progress}/{num_samples} ({current_progress/num_samples*100:.1f}%) - "
-                  f"Rate: {rate:.1f} images/sec - ETA: {eta:.1f}s")
     
     # Create final dataframe with pixel features
     pixel_columns = [f'pixel_{i}' for i in range(num_pixels)]
@@ -418,9 +419,6 @@ def create_pixel_dataframe(df, lookback=100, image_size=(256, 256), style='candl
     # Add target column at the START
     target_values = df_with_target['target'].iloc[lookback:].reset_index(drop=True)
     final_df.insert(0, 'target', target_values)
-    
-    print(f"Done! Created DataFrame with {len(final_df)} samples and {num_pixels} pixel features each.")
-    
 
     return final_df
 
@@ -453,22 +451,351 @@ def preprocess_data(df: pd.DataFrame, image_size=(256, 256)):
     print(f"Number of times y is 1: {y_1_count}")
     
     # Convert target to categorical (3 classes: -1, 0, 1)
-    y = to_categorical(y + 1, num_classes=3)  # Shift -1,0,1 to 0,1,2
+    y = y + 1  # Shift -1,0,1 to 0,1,2
 
     return X, y
+
+def focal_loss(alpha=0.25, gamma=2.0):
+    """
+    Simplified Focal Loss for sparse categorical crossentropy
+    """
+    def focal_loss_fixed(y_true, y_pred):
+        # Get the crossentropy loss
+        ce_loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
+        
+        # Convert to probability (p_t)
+        p_t = tf.exp(-ce_loss)
+        
+        # Calculate focal weight
+        focal_weight = alpha * tf.pow((1 - p_t), gamma)
+        
+        # Apply focal weighting
+        focal_loss = focal_weight * ce_loss
+        
+        return tf.reduce_mean(focal_loss)
+    
+    return focal_loss_fixed
 
 
 def build_model(image_size):
     model = Sequential([
-        Input(image_size[0], image_size[1], 1),
-        Dense(256, activation="relu"),
-        Dense(128, activation="relu"),
+        Input(shape=(image_size[0], image_size[1], 1)),
+        Flatten(),
+        Dense(256, activation="relu", kernel_regularizer=keras.regularizers.l2(0.001)),
+        Dense(128, activation="relu", kernel_regularizer=keras.regularizers.l2(0.001)),
         Dense(3, activation="softmax")
     ])
 
-    model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
+    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
 
     return model
 
-def fit_model(model, X, y):
+def split_data(X, y):
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.3, random_state=42)
+    X_test, X_val, y_test, y_val = train_test_split(X_val, y_val, test_size=0.5, random_state=42)
+
+    return (X_train, y_train), (X_val, y_val), (X_test, y_test)
+
+
+def fit_model(model, X, y, val_data):
+    callbacks = [
+        #EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True),
+        ModelCheckpoint("best_model.keras", save_best_only=True, monitor="val_loss")
+    ]
+
+    history = model.fit(X, y, epochs=1, callbacks=callbacks, validation_data=val_data, verbose=0)
+
+    return history
+
+def plot_training_history(history):
+    """
+    Plot training and validation accuracy and loss from model training history.
     
+    Parameters:
+    - history: History object returned by model.fit()
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    
+    # Plot accuracy
+    ax1.plot(history.history['accuracy'], label='Training Accuracy')
+    if 'val_accuracy' in history.history:
+        ax1.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    ax1.set_title('Model Accuracy')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Accuracy')
+    ax1.legend()
+    ax1.grid(True)
+    
+    # Plot loss
+    ax2.plot(history.history['loss'], label='Training Loss')
+    if 'val_loss' in history.history:
+        ax2.plot(history.history['val_loss'], label='Validation Loss')
+    ax2.set_title('Model Loss')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Loss')
+    ax2.legend()
+    ax2.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+
+class ImageDataGenerator:
+    """Generator for lazy loading of image data from NPZ files"""
+    
+    def __init__(self, data_dir="picture_data", batch_size=4, image_size=(64, 64)):
+        self.data_dir = Path(data_dir)
+        self.batch_size = batch_size
+        self.image_size = image_size
+        self.npz_files = list(self.data_dir.glob("*.npz"))
+        self.n_samples = self._count_total_samples()
+        
+    def _count_total_samples(self):
+        """Count total samples across all NPZ files"""
+        total = 0
+        for npz_file in self.npz_files:
+            with np.load(npz_file) as data:
+                total += len(data['X'])
+        return total
+    
+    def __call__(self):
+        """Generate a random batch of data"""
+        batch_X = []
+        batch_y = []
+        
+        while len(batch_X) < self.batch_size:
+            # Randomly select an NPZ file
+            npz_file = np.random.choice(self.npz_files)
+            
+            with np.load(npz_file) as data:
+                X = data['X']
+                y = data['y']
+                
+                # Randomly select samples from this file
+                n_samples = len(X)
+                if n_samples > 0:
+                    indices = np.random.choice(n_samples, 
+                                             min(self.batch_size - len(batch_X), n_samples), 
+                                             replace=False)
+                    batch_X.extend(X[indices])
+                    batch_y.extend(y[indices])
+        
+        return np.array(batch_X), np.array(batch_y)
+    
+    def get_all_data(self):
+        """Load all data (use sparingly for validation)"""
+        all_X = []
+        all_y = []
+        
+        for npz_file in self.npz_files:
+            with np.load(npz_file) as data:
+                all_X.append(data['X'])
+                all_y.append(data['y'])
+        
+        return np.concatenate(all_X), np.concatenate(all_y)
+
+
+def save_data_to_npz(X, y, filename):
+    """Save preprocessed data to NPZ file"""
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    np.savez_compressed(filename, X=X, y=y)
+    print(f"Saved {len(X)} samples to {filename}")
+
+
+def preprocess_and_save_chunks(data, chunk_size=1000, image_size=(64, 64), data_dir="picture_data"):
+    """Preprocess data in chunks and save to NPZ files"""
+    data_dir = Path(data_dir)
+    data_dir.mkdir(exist_ok=True)
+    
+    for i in range(0, len(data), chunk_size):
+        chunk = data.iloc[i:i+chunk_size]
+        
+        # Skip chunks smaller than lookback
+        if len(chunk) < 100:  # Default lookback
+            print(f"Skipping chunk {i//chunk_size + 1}: only {len(chunk)} samples (need 100+)")
+            continue
+            
+        print(f"Processing chunk {i//chunk_size + 1}: samples {i} to {min(i+chunk_size, len(data))}")
+        
+        df = create_pixel_dataframe(chunk, image_size=image_size)
+        X, y = preprocess_data(df)
+        
+        filename = data_dir / f"chunk_{i//chunk_size:03d}.npz"
+        save_data_to_npz(X, y, filename)
+    
+    print(f"All chunks saved to {data_dir}")
+
+
+def train_with_validation(model, train_generator, val_generator, epochs, batch_size, steps_per_epoch=50):
+    """Train model with validation data"""
+    for epoch in range(epochs):
+        print(f"Epoch {epoch + 1}/{epochs}")
+        
+        # Training
+        train_loss = 0
+        train_accuracy = 0
+        
+        for step in range(steps_per_epoch):
+            X_batch, y_batch = train_generator()
+            X_val, y_val = val_generator()
+            history = fit_model(model, X_batch, y_batch, (X_val, y_val))
+            train_loss += history.history['loss'][0]
+            train_accuracy += history.history['accuracy'][0]
+        
+        # Validation
+        val_loss = 0
+        val_accuracy = 0
+        val_steps = min(20, val_generator.n_samples // batch_size)
+        
+        for step in range(val_steps):
+            X_batch, y_batch = val_generator()
+            val_metrics = model.evaluate(X_batch, y_batch, verbose=0)
+            val_loss += val_metrics[0]
+            val_accuracy += val_metrics[1]
+        
+        avg_train_loss = train_loss / steps_per_epoch
+        avg_train_acc = train_accuracy / steps_per_epoch
+        avg_val_loss = val_loss / val_steps
+        avg_val_acc = val_accuracy / val_steps
+        
+        print(f"Train - Loss: {avg_train_loss:.4f}, Acc: {avg_train_acc:.4f}")
+        print(f"Val   - Loss: {avg_val_loss:.4f}, Acc: {avg_val_acc:.4f}")
+
+
+def plot_training_history(history):
+    """
+    Plot training and validation accuracy and loss from model training history.
+    
+    Parameters:
+    - history: History object returned by model.fit()
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    
+    # Plot accuracy
+    ax1.plot(history.history['accuracy'], label='Training Accuracy')
+    if 'val_accuracy' in history.history:
+        ax1.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    ax1.set_title('Model Accuracy')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Accuracy')
+    ax1.legend()
+    ax1.grid(True)
+    
+    # Plot loss
+    ax2.plot(history.history['loss'], label='Training Loss')
+    if 'val_loss' in history.history:
+        ax2.plot(history.history['val_loss'], label='Validation Loss')
+    ax2.set_title('Model Loss')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Loss')
+    ax2.legend()
+    ax2.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def test_model(model, test_generator, model_name="Model"):
+    """
+    Test a trained model on test data and provide comprehensive evaluation metrics.
+    
+    Parameters:
+    - model: Trained Keras model
+    - test_generator: ImageDataGenerator for test data
+    - model_name: Name for display purposes
+    
+    Returns:
+    - Dictionary with test results
+    """
+    print(f"\n=== Testing {model_name} ===")
+    
+    # Load all test data
+    X_test, y_test = test_generator.get_all_data()
+    print(f"Test data shape: {X_test.shape}")
+    print(f"Test labels shape: {y_test.shape}")
+    
+    # Get predictions
+    y_pred_proba = model.predict(X_test, verbose=0)
+    y_pred = np.argmax(y_pred_proba, axis=1)
+
+    unique, counts = np.unique(y_pred, return_counts=True)
+    print("Prediction counts:")
+    for pred, count in zip(unique, counts):
+        print(f"  Class {pred}: {count} predictions")
+    
+    # Calculate metrics
+    from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+    
+    accuracy = accuracy_score(y_test, y_pred)
+    
+    print(f"\nTest Accuracy: {accuracy:.4f}")
+    print(f"Test Samples: {len(y_test)}")
+    
+    # Class distribution
+    unique, counts = np.unique(y_test, return_counts=True)
+    print(f"\nTest Data Class Distribution:")
+    for cls, count in zip(unique, counts):
+        print(f"  Class {cls}: {count} samples ({count/len(y_test)*100:.1f}%)")
+    
+    # Confusion Matrix
+    cm = confusion_matrix(y_test, y_pred)
+    print(f"\nConfusion Matrix:")
+    print("     Predicted")
+    print("     0  1  2")
+    for i, row in enumerate(cm):
+        print(f"{i}   {row}")
+    
+    # Classification Report
+    print(f"\nDetailed Classification Report:")
+    print(classification_report(y_test, y_pred, 
+                              target_names=['Down (-1)', 'Neutral (0)', 'Up (1)']))
+    
+    # Per-class accuracy
+    print(f"\nPer-Class Accuracy:")
+    for i in range(3):
+        class_mask = y_test == i
+        if np.sum(class_mask) > 0:
+            class_accuracy = accuracy_score(y_test[class_mask], y_pred[class_mask])
+            print(f"  Class {i}: {class_accuracy:.4f} ({np.sum(class_mask)} samples)")
+    
+    # Return results dictionary
+    results = {
+        'accuracy': accuracy,
+        'y_true': y_test,
+        'y_pred': y_pred,
+        'y_pred_proba': y_pred_proba,
+        'confusion_matrix': cm,
+        'classification_report': classification_report(y_test, y_pred, output_dict=True)
+    }
+    
+    return results
+
+
+def compare_models(models_dict, test_generator):
+    """
+    Compare multiple models on the same test data.
+    
+    Parameters:
+    - models_dict: Dictionary with model names as keys and models as values
+    - test_generator: ImageDataGenerator for test data
+    
+    Returns:
+    - Dictionary with comparison results
+    """
+    print(f"\n=== Model Comparison ===")
+    
+    results = {}
+    
+    for name, model in models_dict.items():
+        print(f"\nTesting {name}...")
+        results[name] = test_model(model, test_generator, name)
+    
+    # Summary comparison
+    print(f"\n=== Summary Comparison ===")
+    print(f"{'Model':<20} {'Accuracy':<10} {'Samples':<10}")
+    print("-" * 40)
+    
+    for name, result in results.items():
+        print(f"{name:<20} {result['accuracy']:<10.4f} {len(result['y_true']):<10}")
+    
+    return results
+
