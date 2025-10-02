@@ -105,7 +105,7 @@ def fetch_historical_data(interval='1h', months_back=12):
 # Example usage:
 if __name__ == "__main__":
     # Fetch 12 months of hourly data
-    df = fetch_historical_data(interval='1h', months_back=24)
+    df = fetch_historical_data(interval='1h', months_back=100)
     if df is not None:
         print(f"Fetched {len(df)} candles")
-        df.to_csv("1h_test.csv")
+        df.to_csv("1h_test2.csv")

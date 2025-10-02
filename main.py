@@ -1,10 +1,11 @@
+from keras.utils import plot_model
 from functions import *
 import os
 from pathlib import Path
 
 IMAGE_SIZE = (256, 256)
-BATCH_SIZE = 8
-EPOCHS = 10
+BATCH_SIZE = 2
+EPOCHS = 5
 CHUNK_SIZE = 1000
 
 
@@ -22,8 +23,9 @@ if __name__ == "__main__":
     
     # Train with validation
     print("Starting training...")
-    train_with_validation(model, train_generator, val_generator, epochs=EPOCHS, batch_size=BATCH_SIZE)
+    history = train_with_validation(model, train_generator, val_generator, epochs=EPOCHS, batch_size=BATCH_SIZE)
     test_model(model, test_generator)
+    plot_training_history(history)
     
     # Save final model
     model.save("final_model.keras")

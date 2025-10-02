@@ -7,6 +7,14 @@ import os
 from pathlib import Path
 import math
 
+# Force CPU backend and safer CPU kernels BEFORE importing TensorFlow
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "2"
+os.environ["TF_NUM_INTEROP_THREADS"] = "2"
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 from sklearn.utils import class_weight
@@ -18,6 +26,14 @@ from keras.utils import Sequence
 from keras.models import Sequential, load_model
 from keras.layers import Dense, Input, Flatten, Conv2D, GlobalAveragePooling2D, Dropout
 from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+
+# Configure TensorFlow threading and disable XLA JIT for stability
+tf.config.threading.set_intra_op_parallelism_threads(2)
+tf.config.threading.set_inter_op_parallelism_threads(2)
+try:
+    tf.config.optimizer.set_jit(False)
+except Exception:
+    pass
 
 import warnings
 # Add this line at the top with your other imports
@@ -220,21 +236,64 @@ def preprocess_data(df: pd.DataFrame, image_size=(256, 256)):
 
 
 def build_model(image_size):
-    model = Sequential([
-        Input(shape=(image_size[0], image_size[1], 1)),
-        Conv2D(32, (3,3), padding="same"),
-        Dropout(0.2),
-        Conv2D(16, (2,2), padding="same"),
-        GlobalAveragePooling2D(),
-        Dropout(0.3,),
-        Dense(512, activation="relu", kernel_regularizer=keras.regularizers.l2(0.0001)),
-        Dropout(0.2),
-        Dense(256, activation="relu", kernel_regularizer=keras.regularizers.l2(0.0001)),
-        Dense(3, activation="softmax")
-    ])
+    inputs = keras.Input(shape=(image_size[0], image_size[1], 1))
 
-    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    def se_block(x, reduction=16):
+        channels = x.shape[-1]
+        squeeze = keras.layers.GlobalAveragePooling2D()(x)
+        squeeze = keras.layers.Dense(max(int(channels) // reduction, 8), activation="relu")(squeeze)
+        excite = keras.layers.Dense(int(channels), activation="sigmoid")(squeeze)
+        excite = keras.layers.Reshape((1, 1, int(channels)))(excite)
+        return keras.layers.Multiply()([x, excite])
 
+    def res_block(x, filters, stride=1, use_se=True, drop_rate=0.0):
+        shortcut = x
+        y = keras.layers.Conv2D(filters, 3, strides=stride, padding="same", use_bias=False)(x)
+        y = keras.layers.BatchNormalization()(y)
+        y = keras.layers.Activation("relu")(y)
+        y = keras.layers.Conv2D(filters, 3, strides=1, padding="same", use_bias=False)(y)
+        y = keras.layers.BatchNormalization()(y)
+        if use_se:
+            y = se_block(y)
+        if shortcut.shape[-1] != filters or stride != 1:
+            shortcut = keras.layers.Conv2D(filters, 1, strides=stride, padding="same", use_bias=False)(shortcut)
+            shortcut = keras.layers.BatchNormalization()(shortcut)
+        y = keras.layers.Add()([shortcut, y])
+        y = keras.layers.Activation("relu")(y)
+        if drop_rate > 0:
+            y = keras.layers.Dropout(drop_rate)(y)
+        return y
+
+    # Stem
+    x = keras.layers.Conv2D(64, 7, strides=2, padding="same", use_bias=False)(inputs)
+    x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.Activation("relu")(x)
+    x = keras.layers.MaxPooling2D(pool_size=3, strides=2, padding="same")(x)
+
+    # Stages
+    cfg = [
+        (64,  3, 1, 0.10),
+        (128, 4, 2, 0.15),
+        (256, 6, 2, 0.20),
+        (512, 3, 2, 0.25),
+    ]
+    for filters, blocks, stride, drop in cfg:
+        x = res_block(x, filters, stride=stride, use_se=True, drop_rate=drop)
+        for _ in range(blocks - 1):
+            x = res_block(x, filters, stride=1, use_se=True, drop_rate=drop)
+
+    x = keras.layers.GlobalAveragePooling2D()(x)
+    x = keras.layers.Dropout(0.35)(x)
+    x = keras.layers.Dense(1024, activation="relu")(x)
+    x = keras.layers.Dropout(0.35)(x)
+    outputs = keras.layers.Dense(3, activation="softmax")(x)
+
+    model = keras.Model(inputs, outputs)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=3e-4),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
     return model
 
 def split_data(X, y):
@@ -296,22 +355,8 @@ class ImageDataGenerator(Sequence):
                 n = len(data['X'])
             self.index_map.extend([(fi, si) for si in range(n)])
 
-        # inside ImageDataGenerator.__init__(...)
-        # After you load self.npz_files
-        self.class_to_file_and_idx = {0: [], 1: [], 2: []}
-        for fi, npz in enumerate(self.npz_files):
-            with np.load(npz) as data:
-                y_chunk = data['y']
-                # if one-hot, convert
-                if y_chunk.ndim == 2 and y_chunk.shape[1] == 3:
-                    y_chunk = np.argmax(y_chunk, axis=1)
-                for si, label in enumerate(y_chunk):
-                    if label in (0, 1, 2):
-                        self.class_to_file_and_idx[label].append((fi, si))
-
-        # for fast sampling
-        self.class_arrays = {c: np.array(pairs, dtype=np.int64) for c, pairs in self.class_to_file_and_idx.items()}
-
+        # indices for simple batching
+        self.indices = np.arange(len(self.index_map))
         self.on_epoch_end()
 
     def _count_total_samples(self):
@@ -325,26 +370,16 @@ class ImageDataGenerator(Sequence):
         return int(math.ceil(len(self.index_map) / self.batch_size))
 
     def __getitem__(self, idx):
-        per_class = max(1, self.batch_size // 3)
-        need = {0: per_class, 1: per_class, 2: self.batch_size - 2*per_class}
+        start = idx * self.batch_size
+        end = min(start + self.batch_size, len(self.indices))
+        idx_slice = self.indices[start:end]
 
-        # pick contiguous slices from each class pool (cyclic if short)
-        picks = []
-        for c in (0, 1, 2):
-            pool = self.class_arrays[c]
-            start = (idx * per_class) % max(1, len(pool))
-            end = start + need[c]
-            if end <= len(pool):
-                picks.append(pool[start:end])
-            else:
-                # wrap-around if not enough
-                wrap = end - len(pool)
-                picks.append(np.concatenate([pool[start:], pool[:wrap]], axis=0))
+        # gather pairs for this batch
+        selected_pairs = [self.index_map[i] for i in idx_slice]
 
-        pairs = np.concatenate(picks, axis=0)
         # group by file to minimize I/O
         by_file = {}
-        for fi, si in pairs:
+        for fi, si in selected_pairs:
             by_file.setdefault(int(fi), []).append(int(si))
 
         X_batches, y_batches = [], []
@@ -365,10 +400,10 @@ class ImageDataGenerator(Sequence):
         y = np.concatenate(y_batches, axis=0).astype(np.int32)
         y = y.astype(np.int32).reshape(-1)
 
-        # optional shuffle inside batch
-        idxs = np.arange(len(y))
-        np.random.shuffle(idxs)
-        return X[idxs], y[idxs]
+        # optional shuffle inside batch for randomness
+        order = np.arange(len(y))
+        np.random.shuffle(order)
+        return X[order], y[order]
     # Keep for compatibility if you use it elsewhere
     def __call__(self):
         # Fallback single-batch sampler (unchanged behavior)
@@ -391,8 +426,8 @@ class ImageDataGenerator(Sequence):
         return X, y
 
     def on_epoch_end(self):
-        for c in self.class_arrays:
-            np.random.shuffle(self.class_arrays[c])
+        if self.shuffle:
+            np.random.shuffle(self.indices)
 
 def save_data_to_npz(X, y, filename):
     """Save preprocessed data to NPZ file"""
@@ -436,7 +471,7 @@ def split_and_get_generators(img_size, chunk_size, batch_size):
      
     if not train_files:
         print("Preprocessing data...")
-        data = pd.read_csv("1h_test.csv", index_col=0, parse_dates=True)
+        data = pd.read_csv("1h_test2.csv", index_col=0, parse_dates=True)
         train_data = data
         
         # Split data first
@@ -457,43 +492,58 @@ def split_and_get_generators(img_size, chunk_size, batch_size):
     
     # Create generators for each split
     train_generator = ImageDataGenerator(data_dir="picture_data/train", 
-                                       batch_size=batch_size, image_size=img_size)
+                                       batch_size=batch_size, image_size=img_size, shuffle=True)
     val_generator = ImageDataGenerator(data_dir="picture_data/val", 
-                                     batch_size=batch_size, image_size=img_size)
+                                     batch_size=batch_size, image_size=img_size, shuffle=False)
 
     test_generator = ImageDataGenerator(data_dir="picture_data/test", 
-                                     batch_size=batch_size, image_size=img_size)
+                                     batch_size=batch_size, image_size=img_size, shuffle=False)
     
     return train_generator, val_generator, test_generator
 
 
 def train_with_validation(model, train_generator, val_generator, epochs, batch_size):
-    """Train model with validation data"""
-    X, y = train_generator.get_all_data()
+    """Train model with validation data (CPU-safe)."""
+    # Compute class weights without loading all features into RAM
+    counts = np.zeros(3, dtype=np.int64)
+    for npz_path in train_generator.npz_files:
+        with np.load(npz_path) as data:
+            y_part = data['y']
+            if y_part.ndim == 2 and y_part.shape[1] == 3:
+                y_part = np.argmax(y_part, axis=1)
+            binc = np.bincount(y_part.astype(np.int64), minlength=3)
+            counts += binc
+    total = int(counts.sum()) if counts.sum() > 0 else 1
+    weights = {i: float(total / (3.0 * max(1, int(counts[i])))) for i in range(3)}
 
-    classes = np.array([0, 1, 2])
-    class_weights_array = compute_class_weight(
-        class_weight='balanced',
-        classes=classes,
-        y=y
-    )
+    # Initialize final layer bias to log class priors to avoid initial single-class predictions
+    priors = (counts / max(1, counts.sum())).astype(np.float32)
+    priors = np.clip(priors, 1e-8, 1.0)
+    log_priors = np.log(priors)
+    try:
+        final_dense = model.layers[-1]
+        w, b = final_dense.get_weights()
+        if b.shape[0] == 3:
+            final_dense.set_weights([w, log_priors])
+    except Exception as _:
+        pass
 
-    weights = {int(c): float(w) for c, w in zip(classes, class_weights_array)}
     callbacks = [
         #EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True),
         ModelCheckpoint("best_model.keras", save_best_only=True, monitor="val_loss"),
-        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-5, verbose=1)
+        #ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-5, verbose=1)
     ]
 
     history = model.fit(
         train_generator,
-        epochs=epochs, 
+        epochs=epochs,
         callbacks=callbacks,
         validation_data=val_generator,
         verbose=1,
-        steps_per_epoch=10,
-        validation_steps=3
-        )
+        steps_per_epoch=100,
+        validation_steps=30,
+        class_weight=weights,
+    )
 
     return history
 
